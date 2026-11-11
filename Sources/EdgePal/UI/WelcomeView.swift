@@ -57,7 +57,7 @@ struct WelcomeView: View {
             VStack(alignment: .leading, spacing: 8) {
                 row("speaker.wave.2", "Right edge", "slide for volume")
                 row("sun.max", "Left edge", "slide for brightness")
-                row("play.rectangle", "Bottom edge", "scrub the video or song that's playing")
+                row("play.rectangle", "Bottom edge", "slide sideways to scrub the video or song that's playing")
                 row("square.grid.2x2", "Top corners", "click 1–4 times for your shortcuts")
             }
             Text("Press an edge until the trackpad clicks, then slide. The middle of the trackpad works exactly as before.")

@@ -120,6 +120,10 @@ final class Settings: ObservableObject {
     @Published var volumeEdge: Bool { didSet { save("volumeEdge", volumeEdge) } }
     @Published var brightnessEdge: Bool { didSet { save("brightnessEdge", brightnessEdge) } }
     @Published var timelineEdge: Bool { didSet { save("timelineEdge", timelineEdge) } }
+    /// Bottom edge: the video moves while the finger slides (otherwise it jumps when you let go).
+    @Published var liveScrub: Bool { didSet { save("liveScrub", liveScrub) } }
+    /// Bottom edge: how far the video moves for the same slide. 1 is normal.
+    @Published var scrubSpeed: Double { didSet { save("scrubSpeed", scrubSpeed) } }
     @Published var cornersEnabled: Bool { didSet { save("cornersEnabled", cornersEnabled) } }
     /// false: volume on the right, brightness on the left.
     @Published var swapSides: Bool { didSet { save("swapSides", swapSides) } }
@@ -142,6 +146,7 @@ final class Settings: ObservableObject {
     private init() {
         defaults.register(defaults: [
             "enabled": true, "volumeEdge": true, "brightnessEdge": true, "timelineEdge": true,
+            "liveScrub": true, "scrubSpeed": 1.0,
             "cornersEnabled": true, "swapSides": false, "edgeWidth": 0.10, "stepMM": 4.0,
             "modifier": ModifierRequirement.none.rawValue, "haptics": true, "hapticStrength": 2,
             "pausedApps": [String](), "finishedWelcome": false, "brightnessDirect": false,
@@ -150,6 +155,8 @@ final class Settings: ObservableObject {
         volumeEdge = defaults.bool(forKey: "volumeEdge")
         brightnessEdge = defaults.bool(forKey: "brightnessEdge")
         timelineEdge = defaults.bool(forKey: "timelineEdge")
+        liveScrub = defaults.bool(forKey: "liveScrub")
+        scrubSpeed = defaults.double(forKey: "scrubSpeed")
         cornersEnabled = defaults.bool(forKey: "cornersEnabled")
         swapSides = defaults.bool(forKey: "swapSides")
         edgeWidth = defaults.double(forKey: "edgeWidth")

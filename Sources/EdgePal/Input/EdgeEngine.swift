@@ -5,6 +5,10 @@
 // finger's movement (read from MultitouchSupport) into volume, brightness, a video scrub or a
 // corner shortcut. Anything else passes straight through, so the middle of the trackpad,
 // palms, typing and scrolling behave exactly as before.
+//
+// Many people click with a thumb near the bottom of the trackpad, so a click on the bottom
+// edge is only held back until the finger shows what it wants: sliding sideways scrubs the
+// timeline, anything else gives the click back to the app as if EdgePal weren't there.
 import AppKit
 import ApplicationServices
 import QuartzCore
@@ -39,8 +43,12 @@ struct ZoneLayout {
     }
 }
 
+
 final class EdgeEngine: ObservableObject {
     static let shared = EdgeEngine()
+
+    /// Marks the clicks EdgePal gives back to apps, so its own tap lets them through.
+    static let replayMarker: Int64 = 0x4544_4745 // "EDGE"
 
     /// Shown in the welcome guide and Settings so people can see what just happened.
     @Published private(set) var lastAction = "Waiting for a gesture…"
@@ -57,37 +65,59 @@ final class EdgeEngine: ObservableObject {
         case volume, brightness, timeline, corner(Corner)
     }
 
+    private enum Phase {
+        /// Bottom edge: the click is held back until the finger slides sideways (a scrub) or not.
+        case deciding
+        case active
+        /// Not a gesture after all: the click went to the app, and EdgePal stays out of the way
+        /// until the button comes up.
+        case handedBack
+    }
+
     private struct Gesture {
         var job: Job
         var zone: Zone
+        var phase: Phase
         var device: UInt
         var finger: Int32
         var width: Double
         var edge: Double
         var cursor: CGPoint
+        var startX: Double
+        var startY: Double
         var lastSeen: CFTimeInterval
         var cancelled = false
+        /// The mouse-down EdgePal kept, to give back if this turns out not to be a scrub.
+        var heldDown: CGEvent?
         // Sliders
         var anchorY = 0.0
         var steps = 0
         // Timeline
-        var baseX = 0.0
-        var basePosition = 0.0
-        var startPosition = 0.0
-        var target = 0.0
-        var duration = 0.0
-        var tickIndex = 0
-        var fine = false
+        var scrub: TimelineScrub?
+        var engagedAt: CFTimeInterval = 0
+        /// Where the video was when the scrub began, and how fast it plays by itself.
+        var origin = 0.0
+        var playSpeed = 0.0
+        /// The video follows the finger (Settings › Move the video while sliding).
+        var live = false
+        var detent = 0
+        var lastTick: CFTimeInterval = 0
+        var atLimit = false
+        /// The last position sent to the player while scrubbing live.
+        var sent: (target: Double, at: CFTimeInterval)?
     }
 
     private var gesture: Gesture?
     private var tap: CFMachPort?
     private var tapSource: CFRunLoopSource?
     private var watchdog: Timer?
+    private var liveSeekTimer: Timer?
 
-    // Read on MultitouchSupport's thread.
+    // Shared with MultitouchSupport's thread.
     private let lock = NSLock()
     private var trackingDevice: UInt?
+    private var pendingFrame: TouchFrame?
+    private var drainScheduled = false
     private var wantsPreview = false
     private var lastPreview: CFTimeInterval = 0
 
@@ -157,22 +187,40 @@ final class EdgeEngine: ObservableObject {
 
     private func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         let pass = Unmanaged.passUnretained(event)
-        switch type {
-        case .tapDisabledByTimeout, .tapDisabledByUserInput:
+        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
             if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
             return pass
+        }
+        // A click EdgePal gave back to apps.
+        if event.getIntegerValueField(.eventSourceUserData) == Self.replayMarker { return pass }
+        let phase = gesture?.phase
+        switch type {
         case .leftMouseDown:
-            if gesture != nil { return nil }
+            if phase == .handedBack {
+                endTracking() // Its mouse-up went missing; this is a new click.
+            } else if phase != nil {
+                return nil
+            }
             return begin(event) ? nil : pass
         case .leftMouseDragged:
-            return gesture != nil ? nil : pass
+            return phase == nil || phase == .handedBack ? pass : nil
         case .leftMouseUp:
-            guard gesture != nil else { return pass }
-            finish(normally: true)
-            return nil
+            switch phase {
+            case nil:
+                return pass
+            case .handedBack?:
+                endTracking()
+                return pass
+            case .deciding?:
+                giveClickBack(up: event)
+                return nil
+            case .active?:
+                finish(normally: true)
+                return nil
+            }
         default:
             // Force Touch pressure belongs to the click we kept.
-            return type.rawValue == 34 && gesture != nil ? nil : pass
+            return type.rawValue == 34 && phase != nil && phase != .handedBack ? nil : pass
         }
     }
 
@@ -187,23 +235,18 @@ final class EdgeEngine: ObservableObject {
         let layout = ZoneLayout(width: frame.widthMM, height: frame.heightMM, edgeShare: settings.edgeWidth)
         guard let (job, zone) = resolve(layout.zones(x: finger.x, y: finger.y)) else { return false }
 
-        var g = Gesture(job: job, zone: zone, device: frame.device, finger: finger.id,
+        var g = Gesture(job: job, zone: zone, phase: .active, device: frame.device, finger: finger.id,
                         width: layout.width, edge: layout.edge, cursor: event.location,
-                        lastSeen: CACurrentMediaTime())
+                        startX: finger.x, startY: finger.y, lastSeen: CACurrentMediaTime())
         switch job {
         case .volume, .brightness:
             g.anchorY = finger.y
             report(job == .volume ? "Volume: slide up or down" : "Brightness: slide up or down")
         case .timeline:
-            guard let now = MediaHelper.shared.current else { return false }
-            g.duration = now.duration
-            g.startPosition = now.position()
-            g.basePosition = g.startPosition
-            g.target = g.startPosition
-            g.baseX = finger.x
-            g.tickIndex = tickIndex(g.target, g.duration)
-            ScrubHUD.shared.show(title: now.title, duration: now.duration, start: g.startPosition)
-            report("Timeline: slide sideways, let go to jump")
+            // Nothing shows yet: the click is held back until the finger slides sideways.
+            g.phase = .deciding
+            g.heldDown = event.copy()
+            MediaHelper.shared.refresh() // So the position is fresh when the slide starts.
         case .corner:
             break
         }
@@ -212,8 +255,8 @@ final class EdgeEngine: ObservableObject {
             CGAssociateMouseAndMouseCursorPosition(0)
         }
         gesture = g
-        lock.lock(); trackingDevice = frame.device; lock.unlock()
-        SystemControls.tick(device: frame.device, strength: 1)
+        lock.lock(); trackingDevice = frame.device; pendingFrame = nil; lock.unlock()
+        if g.phase == .active { SystemControls.tick(device: frame.device, strength: 1) }
         startWatchdog()
         return true
     }
@@ -229,7 +272,7 @@ final class EdgeEngine: ObservableObject {
                     return (.corner(corner), zone)
                 }
             case .bottom:
-                if s.timelineEdge, let now = MediaHelper.shared.current, now.duration > 1 {
+                if s.timelineEdge, MediaHelper.shared.current?.canScrub == true {
                     return (.timeline, zone)
                 }
             case .left, .right:
@@ -243,23 +286,66 @@ final class EdgeEngine: ObservableObject {
         return nil
     }
 
+    /// The finger didn't slide: give the app the click it would have had without EdgePal.
+    private func giveClickBack(up: CGEvent) {
+        guard let g = gesture else { return }
+        endTracking()
+        unfreeze(g)
+        if let down = g.heldDown, let up = up.copy() {
+            // Posted in order, after the real mouse-up was kept back, so the app sees down then up.
+            for event in [down, up] {
+                event.setIntegerValueField(.eventSourceUserData, value: Self.replayMarker)
+                event.post(tap: .cgSessionEventTap)
+            }
+        }
+        report("Bottom edge: a plain click, passed to the app")
+    }
+
+    /// The finger moved up or down rather than sideways: it's a normal click or drag. The app gets
+    /// the mouse-down now, then everything after it, as if EdgePal weren't there.
+    private func handBack(_ g: inout Gesture) {
+        g.phase = .handedBack
+        lock.lock(); trackingDevice = nil; pendingFrame = nil; lock.unlock()
+        unfreeze(g)
+        if let down = g.heldDown {
+            down.setIntegerValueField(.eventSourceUserData, value: Self.replayMarker)
+            down.post(tap: .cgSessionEventTap)
+        }
+        g.heldDown = nil
+        report("Bottom edge: not a slide, the click went to the app")
+    }
+
     // MARK: Finger movement
 
-    /// MultitouchSupport's thread.
+    /// MultitouchSupport's thread, 90 or more times a second. Only the newest frame matters, so
+    /// frames are merged: the main thread never works through a backlog of old ones.
     private func received(_ frame: TouchFrame) {
         lock.lock()
-        let tracking = trackingDevice == frame.device
+        var drain = false
+        if trackingDevice == frame.device {
+            pendingFrame = frame
+            if !drainScheduled {
+                drainScheduled = true
+                drain = true
+            }
+        }
         var preview = false
         if wantsPreview, frame.receivedAt - lastPreview > 1.0 / 30 || frame.fingers.isEmpty {
             lastPreview = frame.receivedAt
             preview = true
         }
         lock.unlock()
-        guard tracking || preview else { return }
-        DispatchQueue.main.async {
-            if tracking { self.track(frame) }
-            if preview { self.previewHandler?(frame) }
-        }
+        if drain { DispatchQueue.main.async { self.drainFrames() } }
+        if preview { DispatchQueue.main.async { self.previewHandler?(frame) } }
+    }
+
+    private func drainFrames() {
+        lock.lock()
+        let frame = pendingFrame
+        pendingFrame = nil
+        drainScheduled = false
+        lock.unlock()
+        if let frame { track(frame) }
     }
 
     private func track(_ frame: TouchFrame) {
@@ -289,28 +375,18 @@ final class EdgeEngine: ObservableObject {
                 moves += 1
             }
         case .timeline:
-            if f.y > g.edge * 2.5 {
-                g.cancelled = true
-                ScrubHUD.shared.hide(cancelled: true)
-                SystemControls.tick(device: g.device, strength: 1)
-                report("Timeline: cancelled, the video didn't move")
-                return
+            switch g.phase {
+            case .deciding:
+                switch ScrubIntent.decide(dx: f.x - g.startX, dy: f.y - g.startY) {
+                case .undecided: break
+                case .notAScrub: handBack(&g)
+                case .scrub: engageTimeline(&g, x: f.x, at: frame.receivedAt)
+                }
+            case .active:
+                scrubTimeline(&g, finger: f, at: frame.receivedAt, fine: fine)
+            case .handedBack:
+                break
             }
-            if fine != g.fine {
-                // Re-base so switching to fine control doesn't make the preview jump.
-                g.fine = fine
-                g.baseX = f.x
-                g.basePosition = g.target
-            }
-            let scale = fine ? 0.25 : 1
-            let moved = (f.x - g.baseX) / g.width * g.duration * scale
-            g.target = min(max(0, g.basePosition + moved), max(0, g.duration - 0.5))
-            let index = tickIndex(g.target, g.duration)
-            if index != g.tickIndex {
-                g.tickIndex = index
-                SystemControls.tick(device: g.device)
-            }
-            ScrubHUD.shared.update(target: g.target)
         case .corner:
             break
         }
@@ -344,36 +420,167 @@ final class EdgeEngine: ObservableObject {
         SystemControls.tick(device: g.device)
     }
 
-    /// A tick every 1/40 of the video, but never more often than every 5 seconds.
-    private func tickIndex(_ position: Double, _ duration: Double) -> Int {
-        Int(position / max(duration / 40, 5))
+    // MARK: Timeline
+
+    /// The finger slid sideways: from here on it's a scrub.
+    private func engageTimeline(_ g: inout Gesture, x: Double, at time: CFTimeInterval) {
+        guard let media = MediaHelper.shared.current, media.canScrub else {
+            handBack(&g)
+            return
+        }
+        let settings = Settings.shared
+        let origin = media.position()
+        g.phase = .active
+        g.heldDown = nil
+        g.engagedAt = time
+        g.origin = origin
+        g.playSpeed = media.speed
+        g.live = settings.liveScrub
+        g.scrub = TimelineScrub(duration: media.duration, start: origin, width: g.width, x: x, at: time,
+                                sensitivity: settings.scrubSpeed,
+                                drift: g.live ? media.speed : 0)
+        g.detent = 0
+        g.atLimit = origin <= 0 || origin >= max(0, media.duration - 0.5) // No bump for where it starts.
+        ScrubHUD.shared.show(media: media, at: origin, live: settings.liveScrub)
+        SystemControls.tick(device: g.device, strength: 1)
+        report(settings.liveScrub ? "Timeline: the video follows your finger" : "Timeline: let go to jump")
+    }
+
+    private func scrubTimeline(_ g: inout Gesture, finger f: Finger, at time: CFTimeInterval, fine: Bool) {
+        guard var scrub = g.scrub else { return }
+        if f.y > g.edge * 2.5 {
+            cancelTimeline(&g)
+            return
+        }
+        scrub.update(x: f.x, at: time, fine: fine)
+        g.scrub = scrub
+        let target = scrub.target
+        // Where the video would be without the scrub: it moves on by itself while playing along.
+        let reference = min(g.origin + scrub.drift * (time - g.engagedAt), scrub.end)
+        // A detent every so often as the finger moves the video (not as it plays on by itself),
+        // and a firmer bump on reaching the start or the end.
+        let detent = TimelineScrub.detent(target - reference, duration: scrub.duration)
+        let atLimit = target <= 0 || target >= scrub.end
+        if atLimit, !g.atLimit {
+            SystemControls.tick(device: g.device, strength: 3)
+            g.lastTick = time
+        } else if detent != g.detent, time - g.lastTick > 0.03 {
+            SystemControls.tick(device: g.device)
+            g.lastTick = time
+        }
+        g.detent = detent
+        g.atLimit = atLimit
+        ScrubHUD.shared.update(target: target, reference: reference, fine: fine)
+        if g.live { liveSeek(&g, at: time) }
+    }
+
+    /// While scrubbing live the video follows the finger, with at most one seek every 0.15 s (a
+    /// player can't show new frames any faster) and always the latest position in the end.
+    private static let liveSeekInterval: CFTimeInterval = 0.15
+
+    private func liveSeek(_ g: inout Gesture, at time: CFTimeInterval) {
+        guard let scrub = g.scrub else { return }
+        let target = scrub.target(at: time)
+        guard abs(target - playerPosition(g, at: time)) >= 0.25 else { return }
+        let wait = (g.sent.map { $0.at + Self.liveSeekInterval } ?? 0) - time
+        if wait <= 0 {
+            MediaHelper.shared.seek(to: target)
+            g.sent = (target, time)
+        } else if liveSeekTimer == nil {
+            let timer = Timer(timeInterval: wait, repeats: false) { [weak self] _ in
+                guard let self else { return }
+                self.liveSeekTimer = nil
+                guard var g = self.gesture, g.phase == .active, !g.cancelled else { return }
+                self.liveSeek(&g, at: CACurrentMediaTime())
+                self.gesture = g
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            liveSeekTimer = timer
+        }
+    }
+
+    /// Where the player should be now: the last position sent to it (or where it was when the
+    /// scrub began), plus whatever it has played since.
+    private func playerPosition(_ g: Gesture, at time: CFTimeInterval) -> Double {
+        if let sent = g.sent { return sent.target + g.playSpeed * (time - sent.at) }
+        return g.origin + g.playSpeed * (time - g.engagedAt)
+    }
+
+    /// Slid up off the edge: nothing changes, and a video that followed the finger goes back.
+    private func cancelTimeline(_ g: inout Gesture) {
+        g.cancelled = true
+        liveSeekTimer?.invalidate()
+        liveSeekTimer = nil
+        let back = min(max(0, g.origin + g.playSpeed * (CACurrentMediaTime() - g.engagedAt)),
+                       g.scrub?.end ?? g.origin)
+        if g.sent != nil {
+            MediaHelper.shared.seek(to: back)
+        }
+        ScrubHUD.shared.finish(.cancelled, at: back)
+        SystemControls.tick(device: g.device, strength: 1)
+        report("Timeline: cancelled, the video is where it was")
+    }
+
+    private func finishTimeline(_ g: Gesture, normally: Bool) {
+        guard !g.cancelled, let scrub = g.scrub else { return }
+        let now = CACurrentMediaTime()
+        guard normally else {
+            // Lost track of the click: leave the video wherever it is now.
+            ScrubHUD.shared.finish(g.sent == nil ? .cancelled : .landed, at: playerPosition(g, at: now))
+            return
+        }
+        let landing = scrub.settledTarget(at: now)
+        // When the video already followed the finger there's usually nothing left to do.
+        if abs(landing - playerPosition(g, at: now)) > 0.35 {
+            MediaHelper.shared.seek(to: landing)
+        }
+        ScrubHUD.shared.finish(.landed, at: landing)
+        report("Timeline: \(formatTime(landing)) of \(formatTime(scrub.duration))")
     }
 
     // MARK: Finishing
 
     private func finish(normally: Bool) {
         guard let g = gesture else { return }
-        gesture = nil
-        lock.lock(); trackingDevice = nil; lock.unlock()
-        watchdog?.invalidate()
-        watchdog = nil
-
+        endTracking()
+        switch g.phase {
+        case .handedBack:
+            return // The app has the click; the pointer is already free.
+        case .deciding:
+            // Its mouse-up went missing, so the click can't be given back. Just let go.
+            unfreeze(g)
+            return
+        case .active:
+            break
+        }
         switch g.job {
         case .timeline:
-            if normally, !g.cancelled {
-                MediaHelper.shared.seek(to: g.target)
-                ScrubHUD.shared.hide(cancelled: false)
-                report("Jumped to \(formatTime(g.target))")
-            } else {
-                ScrubHUD.shared.hide(cancelled: true)
-            }
+            finishTimeline(g, normally: normally)
         case .corner(let corner):
             if normally { CornerClicks.shared.click(corner) }
         case .volume, .brightness:
             break
         }
         if case .corner = g.job { return }
-        CGWarpMouseCursorPosition(g.cursor)
+        unfreeze(g)
+    }
+
+    /// Forgets the current gesture. The caller decides what happens to the click and the pointer.
+    private func endTracking() {
+        gesture = nil
+        lock.lock(); trackingDevice = nil; pendingFrame = nil; lock.unlock()
+        watchdog?.invalidate()
+        watchdog = nil
+        liveSeekTimer?.invalidate()
+        liveSeekTimer = nil
+    }
+
+    /// Lets the pointer move again, exactly where it was.
+    private func unfreeze(_ g: Gesture) {
+        // Warping mutes the trackpad for a moment, so only warp if the pointer really moved.
+        if let now = CGEvent(source: nil)?.location, hypot(now.x - g.cursor.x, now.y - g.cursor.y) > 0.5 {
+            CGWarpMouseCursorPosition(g.cursor)
+        }
         CGAssociateMouseAndMouseCursorPosition(1)
     }
 
@@ -383,6 +590,10 @@ final class EdgeEngine: ObservableObject {
         watchdog = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             guard let self, let g = self.gesture else { return }
             let buttonDown = CGEventSource.buttonState(.hidSystemState, button: .left)
+            if g.phase == .handedBack {
+                if !buttonDown { self.endTracking() }
+                return
+            }
             if !buttonDown || CACurrentMediaTime() - g.lastSeen > 3 {
                 self.finish(normally: !buttonDown)
             }

@@ -131,7 +131,7 @@ private struct EdgesPane: View {
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity)
             } footer: {
-                Text("Press an edge until the trackpad clicks, then slide. The middle works as always.")
+                Text("Press an edge until the trackpad clicks, then slide. The middle works as always, and a click on the bottom edge that doesn't slide still reaches your apps.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -139,6 +139,8 @@ private struct EdgesPane: View {
                 Toggle("Volume (\(settings.swapSides ? "left" : "right") edge)", isOn: $settings.volumeEdge)
                 Toggle("Brightness (\(settings.swapSides ? "right" : "left") edge)", isOn: $settings.brightnessEdge)
                 Toggle("Video and music timeline (bottom edge)", isOn: $settings.timelineEdge)
+                Toggle("Move the video while sliding", isOn: $settings.liveScrub)
+                    .disabled(!settings.timelineEdge)
                 Toggle("Swap volume and brightness", isOn: $settings.swapSides)
                 if settings.brightnessDirect {
                     Text("This Mac ignores brightness keys pressed by apps, so EdgePal sets the brightness directly. You won't see the brightness indicator.")
@@ -163,7 +165,16 @@ private struct EdgesPane: View {
                             .frame(width: 56, alignment: .trailing)
                     }
                 }
-                Text("Hold ⇧ Shift and ⌥ Option while sliding for quarter steps and finer scrubbing.")
+                LabeledContent("Timeline speed") {
+                    HStack {
+                        Slider(value: $settings.scrubSpeed, in: 0.5 ... 2, step: 0.25)
+                        Text(settings.scrubSpeed.formatted(.number.precision(.fractionLength(0 ... 2))) + "×")
+                            .monospacedDigit()
+                            .frame(width: 44, alignment: .trailing)
+                    }
+                }
+                .disabled(!settings.timelineEdge)
+                Text("On the bottom edge, slide slowly for small moves and quickly to cross a long video. Hold ⇧ Shift and ⌥ Option while sliding for quarter steps and finer scrubbing.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
